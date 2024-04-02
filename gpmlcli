@@ -1,0 +1,525 @@
+#!/bin/bash
+
+# Copyright (c) 2025 Paul Beard. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+# OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+
+set -e
+
+usage ()
+{
+    echo "gpmlcli version 1.0.0
+Copyright (c) 2025 Paul Beard.
+Website: paulbeard.name
+
+gpmlcli is a tool for uploading and downloading GoPro videos to and from the GoPro Media Library.
+
+Usage: gpmlcli [-h] COMMAND
+
+Commands:
+ login EMAIL PASSWORD
+ logout
+ list [-c]
+ find [-c] SRC...
+ rename FROM TO
+ delete NAME
+ upload SRC...
+ download NAME...
+
+Options:
+ -h show this help
+ -c format columns" >&2
+}
+
+while getopts h OPT
+do
+    usage
+    [[ $OPT == h ]]
+    exit
+done
+shift $((OPTIND-1))
+OPTIND=1
+
+if [[ $# -lt 1 ]]
+then
+    usage
+    exit 1
+fi
+COMMAND=$1
+shift
+
+DATA_DIR=~/.gpmlcli
+COOKIES="${DATA_DIR:?}"/cookies.tsv
+LOGIN_FILE="${DATA_DIR:?}"/login.json
+TIMEOUT_SECONDS=60
+API_BASE_URL=https://api.gopro.com
+
+if perl -MFile::Find -e '' 2>/dev/null # Check for perl and the File::Find perl module
+then
+    findw ()
+    {
+        # Fast find
+        perl -MFile::Find -e 'use warnings "File::Find";foreach(@ARGV){File::Find::find({wanted=>sub{(($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime)=lstat($_))&&(-f _)&&printf"%s\t%s\t%s\n",$size,$mtime,$_;},no_chdir=>1},$_);}' -- "$@"
+    }
+elif find . -quit -printf '' 2>/dev/null # GNU find
+then
+    findw ()
+    {
+        find -- "$@" -type f -printf '%s\t%Ts\t%p\n'
+    }
+elif gfind . -quit -printf '' 2>/dev/null # GNU find
+then
+    findw ()
+    {
+        gfind -- "$@" -type f -printf '%s\t%Ts\t%p\n'
+    }
+else # BSD stat
+    findw ()
+    {
+        # Slow find
+        find -- "$@" -type f -exec stat -f '%z%t%m%t%N' {} +
+    }
+fi
+
+curlw ()
+{
+    CURL_ARGS=(-m "${TIMEOUT_SECONDS:?}" -s -S --fail-with-body -c "${COOKIES:?}")
+
+    if [[ -e "${COOKIES:?}" ]]
+    then
+        CURL_ARGS+=(-b "${COOKIES:?}")
+    fi
+
+    if [[ -s "${LOGIN_FILE:?}" ]] &&
+        TOKEN_TYPE=$(jq .token_type -r -- "${LOGIN_FILE:?}") &&
+        [[ "${TOKEN_TYPE?}" == bearer ]] &&
+        ACCESS_TOKEN=$(jq .access_token -r -- "${LOGIN_FILE:?}") &&
+        [[ "${ACCESS_TOKEN?}" ]]
+    then
+        CURL_ARGS+=(-H "Authorization: Bearer ${ACCESS_TOKEN:?}")
+    fi
+
+    curl "${CURL_ARGS[@]}" "$@"
+}
+
+gpmlcli-login ()
+{
+    while getopts h OPT
+    do
+        usage
+        [[ $OPT == h ]]
+        return
+    done
+    shift $((OPTIND-1))
+
+    if [[ $# -ne 2 ]]
+    then
+        usage
+        return 1
+    fi
+
+    EMAIL=$1
+    PASSWORD=$2
+
+    LOGIN_REQUEST=$(jq --arg EMAIL "${EMAIL:?}" --arg PASSWORD "${PASSWORD:?}" \
+        '.username = $EMAIL | .password = $PASSWORD' <<<'{"client_id":"59f615e2be4b78f66e072781fe19ea712963e5438961245bb4402691afc69ddb","client_secret":"d096534810b3ef5c7c1bcd299cff4c2cea4ad8f231bd7e84fb1d8a03d1c486ea","grant_type":"password","scope":"public me upload live winter_alpha media_library_beta oauth2:merge"}')
+
+    mkdir -p -- "${DATA_DIR:?}"
+
+    curlw -X POST "${API_BASE_URL:?}/v1/oauth2/token" \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/vnd.gopro.jk.oauth-identity+json; version=2.0.0' \
+        --data-binary "${LOGIN_REQUEST:?}" \
+        -o "${LOGIN_FILE:?}"
+}
+
+gpmlcli-logout ()
+{
+    while getopts h OPT
+    do
+        usage
+        [[ $OPT == h ]]
+        return
+    done
+    shift $((OPTIND-1))
+
+    if [[ $# -ne 0 ]]
+    then
+        usage
+        return 1
+    fi
+
+    rm -f -- "${DATA_DIR:?}"
+}
+
+get-all-media ()
+{
+    PAGES=1
+    for ((PAGE=1; PAGE <= PAGES; PAGE++))
+    do
+        SEARCH_RESPONSE=$(curlw "${API_BASE_URL:?}/media/search?fields=camera_model,captured_at,content_title,content_type,created_at,gopro_user_id,gopro_media,filename,file_extension,file_size,height,fov,id,item_count,moments_count,on_public_profile,orientation,play_as,ready_to_edit,ready_to_view,resolution,source_duration,token,type,width,submitted_at,captured_at_timezone&order_by=id&per_page=200&page=${PAGE:?}" \
+            -H 'Accept: application/vnd.gopro.jk.media+json; version=2.0.0')
+        PAGES=$(jq ._pages.total_pages -r <<<"${SEARCH_RESPONSE:?}")
+        jq '._embedded.media[] | [ .id, .captured_at, .file_size, .content_title, .ready_to_view ] | map(if . == "" or . == null then "-" else . end) | @tsv' -r <<<"${SEARCH_RESPONSE:?}"
+    done |
+    sort -t $'\t' -k 4,4
+}
+
+get-media ()
+{
+    NAME=$1
+    PAGES=1
+    for ((PAGE=1; PAGE <= PAGES; PAGE++))
+    do
+        SEARCH_RESPONSE=$(curlw "${API_BASE_URL:?}/media/search?fields=camera_model,captured_at,content_title,content_type,created_at,gopro_user_id,gopro_media,filename,file_extension,file_size,height,fov,id,item_count,moments_count,on_public_profile,orientation,play_as,ready_to_edit,ready_to_view,resolution,source_duration,token,type,width,submitted_at,captured_at_timezone&per_page=200&page=${PAGE:?}" \
+            -H 'Accept: application/vnd.gopro.jk.media+json; version=2.0.0')
+        PAGES=$(jq ._pages.total_pages -r <<<"${SEARCH_RESPONSE:?}")
+        MEDIA=$(jq --arg NAME "${NAME?}" '._embedded.media[] | select(.content_title == $NAME)' <<<"${SEARCH_RESPONSE:?}")
+        jq '[ .id, .captured_at, .file_size, .content_title, .ready_to_view ] | map(if . == "" or . == null then "-" else . end) | @tsv' -r <<<"${MEDIA?}"
+        if [[ "${NAME?}" && "${MEDIA?}" ]]
+        then
+            break
+        fi
+    done
+}
+
+# shellcheck disable=SC2120
+gpmlcli-list ()
+{
+    COLUMN=1
+    while getopts hc OPT
+    do
+        case "${OPT:?}" in
+            c)
+                COLUMN=0
+                ;;
+            *)
+                usage
+                [[ $OPT == h ]]
+                return
+                ;;
+        esac
+    done
+    shift $((OPTIND-1))
+
+    if [[ $# -gt 0 ]]
+    then
+        usage
+        return 1
+    fi
+
+    get-all-media |
+    cut -d $'\t' -f 2,3,4,5 |
+    if [[ "${COLUMN:?}" -eq 0 ]]
+    then
+        column -s $'\t' -t
+    else
+        cat
+    fi
+}
+
+gpmlcli-find ()
+{
+    COLUMN=1
+    while getopts hc OPT
+    do
+        case "${OPT:?}" in
+            c)
+                COLUMN=0
+                ;;
+            *)
+                usage
+                [[ $OPT == h ]]
+                return
+                ;;
+        esac
+    done
+    shift $((OPTIND-1))
+
+    if [[ $# -lt 1 ]]
+    then
+        usage
+        return 1
+    fi
+
+    get-all-media |
+    {
+        findw "$@" |
+        while IFS=$'\t' read -r LOCAL_SIZE LOAL_MTIME LOCAL_PATH
+        do
+            LOCAL_NAME=$(basename -- "${LOCAL_PATH:?}")
+            case "${LOCAL_NAME:?}" in
+                .DS_Store|.localized)
+                    continue
+                    ;;
+            esac
+
+            echo "${LOCAL_SIZE:?}"$'\t'"${LOAL_MTIME:?}"$'\t'"${LOCAL_NAME:?}"$'\t'"${LOCAL_PATH:?}"
+        done |
+        sort -t $'\t' -k 3,3 -u |
+        join -t $'\t' -1 3 -2 4 -o 2.3,1.1,1.2,1.3,1.4 -a 1 -e - -- - /dev/fd/4
+    } 4<&0 |
+    if [[ "${COLUMN:?}" -eq 0 ]]
+    then
+        column -s $'\t' -t
+    else
+        cat
+    fi
+}
+
+gpmlcli-rename ()
+{
+    while getopts h OPT
+    do
+        usage
+        [[ $OPT == h ]]
+        return
+    done
+    shift $((OPTIND-1))
+
+    if [[ $# -ne 2 ]]
+    then
+        usage
+        return 1
+    fi
+
+    FROM_NAME=$1
+    TO_NAME=$2
+
+    if [[ ! "${FROM_NAME:?}" || ! "${TO_NAME:?}" ]]
+    then
+        usage
+        return 1
+    fi
+
+    get-media "${FROM_NAME:?}" |
+    while IFS=$'\t' read -r REMOTE_ID REMOTE_CAPTURED_AT REMOTE_SIZE REMOTE_NAME REMOTE_READY_TO_VIEW
+    do
+        if [[ "${REMOTE_NAME:?}" == "${FROM_NAME:?}" ]]
+        then
+            echo "Renaming ${FROM_NAME:?} to ${TO_NAME:?}." >&2
+
+            MEDIA_REQUEST=$(jq --arg CONTENT_TITLE "${TO_NAME:?}" '.filename = $CONTENT_TITLE | .content_title = $CONTENT_TITLE' -r <<<'{}')
+
+            if [[ "${TO_NAME:?}" == [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ * ]]
+            then
+                TIME_OFFSET=$(date -Iseconds | sed -E 's/^[0-9]+-[0-9]+-[0-9]+T[0-9]+:[0-9]+:[0-9]+//')
+                CAPTURED_AT=${TO%% *}T00:00:00${TIME_OFFSET:?}
+                MEDIA_REQUEST=$(jq --arg CAPTURED_AT "${CAPTURED_AT:?}" '.captured_at = $CAPTURED_AT' -r <<<"${MEDIA_REQUEST:?}")
+            fi
+
+            curlw -X PUT "${API_BASE_URL:?}/media/${REMOTE_ID:?}" \
+                -H 'Content-Type: application/json' \
+                -H 'Accept: application/vnd.gopro.jk.media+json; version=2.0.0' \
+                --data-binary "${MEDIA_REQUEST:?}" \
+                -o /dev/null
+
+            echo "Renamed  ${FROM_NAME:?} to ${TO_NAME:?}." >&2
+        fi
+    done
+}
+
+gpmlcli-delete ()
+{
+    while getopts h OPT
+    do
+        usage
+        [[ $OPT == h ]]
+        return
+    done
+    shift $((OPTIND-1))
+
+    if [[ $# -ne 1 ]]
+    then
+        usage
+        return 1
+    fi
+
+    NAME=$1
+
+    get-media "${NAME:?}" |
+    while IFS=$'\t' read -r REMOTE_ID REMOTE_CAPTURED_AT REMOTE_SIZE REMOTE_NAME REMOTE_READY_TO_VIEW
+    do
+        if [[ "${REMOTE_NAME:?}" == "${NAME:?}" ]]
+        then
+            echo "Deleting ${NAME:?}." >&2
+
+            curlw -X DELETE "${API_BASE_URL:?}/media?ids=${REMOTE_ID:?}" \
+                -H 'Accept: application/vnd.gopro.jk.media+json; version=2.0.0' >/dev/null
+
+            echo "Deleted  ${NAME:?}." >&2
+        fi
+    done
+}
+
+gpmlcli-upload ()
+{
+    while getopts h OPT
+    do
+        usage
+        [[ $OPT == h ]]
+        return
+    done
+    shift $((OPTIND-1))
+    OPTIND=1
+
+    gpmlcli-find "$@" |
+    while IFS=$'\t' read -r REMOTE_SIZE LOCAL_SIZE LOCAL_MTIME LOCAL_NAME LOCAL_PATH
+    do
+        if [[ "${REMOTE_SIZE:?}" != - ]]
+        then
+            continue
+        fi
+
+        echo "Uploading ${LOCAL_NAME:?}." >&2
+
+        FILE_EXTENSION=${LOCAL_NAME##*.}
+        TIME_OFFSET=$(date -Iseconds | sed -E 's/^[0-9]+-[0-9]+-[0-9]+T[0-9]+:[0-9]+:[0-9]+//')
+
+        if [[ "${LOCAL_NAME:?}" == [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ * ]]
+        then
+            CAPTURED_AT=${LOCAL_NAME%% *}T00:00:00${TIME_OFFSET:?}
+        else
+            CAPTURED_AT=$(jq -n --arg LOCAL_MTIME "${LOCAL_MTIME:?}" '$LOCAL_MTIME | tonumber | strflocaltime("%Y-%m-%dT%H:%M:%S")' -r)${TIME_OFFSET:?}
+        fi
+
+        MEDIA_REQUEST=$(jq --arg FILE_EXTENSION "${FILE_EXTENSION:?}" --arg CONTENT_TITLE "${LOCAL_NAME:?}" \
+            '.file_extension = $FILE_EXTENSION | .filename = $CONTENT_TITLE | .content_title = $CONTENT_TITLE' <<<'{"type":"Video","on_public_profile":false,"content_source":"web_media_library"}')
+        MEDIA_RESPONSE=$(curlw -X POST "${API_BASE_URL:?}/media" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/vnd.gopro.jk.media+json; version=2.0.0' \
+            --data-binary "${MEDIA_REQUEST:?}")
+        MEDIUM_ID=$(jq .id -r <<<"${MEDIA_RESPONSE:?}")
+
+        DERIVATIVES_REQUEST=$(jq --arg MEDIUM_ID "${MEDIUM_ID:?}" --arg FILE_EXTENSION "${FILE_EXTENSION:?}" --arg FILENAME "${LOCAL_NAME:?}" \
+            '.medium_id = $MEDIUM_ID | .file_extension = $FILE_EXTENSION' <<<'{"type":"Source","label":"Source","available":false,"item_count":1,"camera_positions":"default","on_public_profile":false}')
+        DERIVATIVES_RESPONSE=$(curlw -X POST "${API_BASE_URL:?}/derivatives" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/vnd.gopro.jk.derivatives+json; version=2.0.0' \
+            --data-binary "${DERIVATIVES_REQUEST:?}")
+        DERIVATIVE_ID=$(jq .id -r <<<"${DERIVATIVES_RESPONSE:?}")
+
+        USER_UPLOADS_REQUEST=$(jq --arg DERIVATIVE_ID "${DERIVATIVE_ID:?}" \
+            '.derivative_id = $DERIVATIVE_ID' <<<'{"item_number":1,"camera_position":"default"}')
+        USER_UPLOADS_RESPONSE=$(curlw -X POST "${API_BASE_URL:?}/user-uploads" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/vnd.gopro.jk.user-uploads+json; version=2.0.0' \
+            --data-binary "${USER_UPLOADS_REQUEST:?}")
+        USER_UPLOAD_ID=$(jq .id -r <<<"${USER_UPLOADS_RESPONSE:?}")
+
+        PAGES=1
+        for ((PAGE=1; PAGE <= PAGES; PAGE++))
+        do
+            USER_UPLOAD_RESPONSE=$(curlw "${API_BASE_URL:?}/user-uploads/${DERIVATIVE_ID:?}?id=${USER_UPLOAD_ID:?}&page=${PAGE:?}&per_page=1&item_number=1&camera_position=default&file_size=${LOCAL_SIZE:?}&part_size=${LOCAL_SIZE:?}" \
+                -H 'Content-Type: application/json' \
+                -H 'Accept: application/vnd.gopro.jk.user-uploads+json; version=2.0.0')
+            PAGES=$(jq ._pages.total_pages -r <<<"${USER_UPLOAD_RESPONSE:?}")
+            jq '._embedded.authorizations[] | [ .method, .url ] | map(if . == "" or . == null then "-" else . end) | @tsv' -r <<<"${USER_UPLOAD_RESPONSE:?}"
+        done |
+        while IFS=$'\t' read -r METHOD URL
+        do
+            curl --connect-timeout "${TIMEOUT_SECONDS:?}" --retry 2 --retry-connrefused --fail-with-body -X "${METHOD:?}" "${URL:?}" -T "${LOCAL_PATH:?}"
+        done
+
+        UPLOAD_COMPLETED_AT=$(jq -n 'now | strflocaltime("%Y-%m-%dT%H:%M:%S")' -r)${TIME_OFFSET:?}
+
+        USER_UPLOAD_REQUEST=$(jq --arg USER_UPLOAD_ID "${USER_UPLOAD_ID:?}" --arg DERIVATIVE_ID "${DERIVATIVE_ID:?}" --arg LOCAL_SIZE "${LOCAL_SIZE:?}" \
+            '.id = $USER_UPLOAD_ID | .derivative_id = $DERIVATIVE_ID | .file_size = $LOCAL_SIZE | .part_size = $LOCAL_SIZE' <<<'{"item_number":1,"camera_position":"default","complete":true}')
+        USER_UPLOAD_RESPONSE=$(curlw -X PUT "${API_BASE_URL:?}/user-uploads/${DERIVATIVE_ID:?}" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/vnd.gopro.jk.user-uploads+json; version=2.0.0' \
+            --data-binary "${USER_UPLOAD_REQUEST:?}")
+
+        DERIVATIVE_REQUEST='{"available":true}'
+        # shellcheck disable=SC2034
+        DERIVATIVE_RESPONSE=$(curlw -X PUT "${API_BASE_URL:?}/derivatives/${DERIVATIVE_ID:?}" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/vnd.gopro.jk.derivatives+json; version=2.0.0' \
+            --data-binary "${DERIVATIVE_REQUEST:?}")
+
+        MEDIA_REQUEST=$(jq --arg UPLOAD_COMPLETED_AT "${UPLOAD_COMPLETED_AT:?}" --arg CAPTURED_AT "${CAPTURED_AT:?}" \
+            '.upload_completed_at = $UPLOAD_COMPLETED_AT | .client_updated_at = $UPLOAD_COMPLETED_AT | .captured_at = $CAPTURED_AT' -r <<<'{"revision_number":0}')
+        MEDIA_RESPONSE=$(curlw -X PUT "${API_BASE_URL:?}/media/${MEDIUM_ID:?}" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/vnd.gopro.jk.media+json; version=2.0.0' \
+            --data-binary "${MEDIA_REQUEST:?}")
+
+        echo "Uploaded  ${LOCAL_NAME:?}." >&2
+    done
+}
+
+gpmlcli-download ()
+{
+    while getopts h OPT
+    do
+        usage
+        [[ $OPT == h ]]
+        return
+    done
+    shift $((OPTIND-1))
+
+    if [[ $# -lt 1 ]]
+    then
+        usage
+        return 1
+    fi
+
+    # shellcheck disable=SC2034
+    get-all-media |
+    while IFS=$'\t' read -r REMOTE_ID REMOTE_CAPTURED_AT REMOTE_SIZE REMOTE_NAME REMOTE_READY_TO_VIEW
+    do
+        for NAME
+        do
+            if [[ "${REMOTE_NAME:?}" == "${NAME:?}" ]]
+            then
+                curlw "${API_BASE_URL:?}/media/${REMOTE_ID:?}/download" \
+                    -H 'Accept: application/vnd.gopro.jk.media+json; version=2.0.0' |
+                jq --arg REMOTE_CAPTURED_AT "${REMOTE_CAPTURED_AT:?}" --arg NAME "${NAME:?}" '._embedded.files[] | [$REMOTE_CAPTURED_AT, $NAME, .url] | @tsv' -r
+            fi
+        done
+    done |
+    while IFS=$'\t' read -r REMOTE_CAPTURED_AT REMOTE_NAME REMOTE_URL
+    do
+        LOCAL_NAME=$(basename -- "${REMOTE_NAME:?}")
+        if [[ -e "${LOCAL_NAME:?}" ]]
+        then
+            echo "${LOCAL_NAME:?} already exists." >&2
+            continue
+        fi
+
+        echo "Downloading ${LOCAL_NAME:?}." >&2
+        rm -f -- "${LOCAL_NAME:?}.download"
+        curl --connect-timeout "${TIMEOUT_SECONDS:?}" --retry 2 --retry-connrefused --fail-with-body -o "${LOCAL_NAME:?}.download" "${REMOTE_URL:?}"
+        touch -c -m -d "${REMOTE_CAPTURED_AT:?}" -- "${LOCAL_NAME:?}.download"
+        mv -n -- "${LOCAL_NAME:?}.download" "${LOCAL_NAME:?}"
+        echo "Downloaded  ${LOCAL_NAME:?}." >&2
+    done
+}
+
+FUNCTION=gpmlcli-"${COMMAND:?}"
+if ! declare -f -F "${FUNCTION:?}" >/dev/null
+then
+    usage
+    exit 1
+fi
+
+"${FUNCTION:?}" "$@"
