@@ -1,0 +1,161 @@
+#!/bin/bash
+
+set -e
+
+usage ()
+{
+    echo "Usage: gpmlclitest [-h] EMAIL PASSWORD" >&2
+}
+
+while getopts h OPT
+do
+    usage
+    [[ $OPT == h ]]
+    exit
+done
+shift $((OPTIND-1))
+OPTIND=1
+
+if [[ $# -ne 2 ]]
+then
+    usage
+    exit 1
+fi
+EMAIL=$1
+PASSWORD=$2
+
+assert ()
+{
+    EXPECTED_EXIT_CODE=0
+    EXPECTED_OUTPUT=
+    while getopts he:o: OPT
+    do
+        case "${OPT:?}" in
+            e)
+                EXPECTED_EXIT_CODE="${OPTARG:?}"
+                ;;
+            o)
+                EXPECTED_OUTPUT="${OPTARG:?}"
+                ;;
+            *)
+                echo "assert [-e EXPECTED_EXIT_CODE] [-o EXPECTED_OUTPUT] COMMAND..." >&2
+                [[ $OPT == h ]]
+                return
+                ;;
+        esac
+    done
+    shift $((OPTIND-1))
+    OPTIND=1
+
+    echo "Running: $*" >&2
+    if ACTUAL_OUTPUT=$("$@" 2>&1)
+    then
+        ACTUAL_EXIT_CODE=$?
+    else
+        ACTUAL_EXIT_CODE=$?
+    fi
+
+    if [[ "${ACTUAL_OUTPUT?}" != "${EXPECTED_OUTPUT?}" ]]
+    then
+        if [[ "${EXPECTED_OUTPUT?}" ]]
+        then
+            echo "Expected output: ${EXPECTED_OUTPUT?}" >&2
+        else
+            echo "Expected no output." >&2
+        fi
+        if [[ "${ACTUAL_OUTPUT?}" ]]
+        then
+            echo "Actual output: ${ACTUAL_OUTPUT?}" >&2
+        else
+            echo "No output." >&2
+        fi
+        exit 1
+    fi
+
+    if [[ "${ACTUAL_EXIT_CODE?}" != "${EXPECTED_EXIT_CODE?}" ]]
+    then
+        echo "$@" >&2
+        echo "Expected exit code: ${EXPECTED_EXIT_CODE?}" >&2
+        echo "Actual exit code: ${ACTUAL_EXIT_CODE?}" >&2
+        exit 1
+    fi
+}
+
+cd -- "$(dirname -- "$0")"
+rm -rf gpmlclitest.tmp
+mkdir gpmlclitest.tmp
+
+USAGE='gpmlcli version 1.1.0
+Copyright (c) 2025 Paul Beard.
+Website: paulbeard.name
+
+gpmlcli is a tool for uploading, and downloading GoPro videos to, and from the GoPro Media Library.
+
+Usage: gpmlcli [-h] COMMAND
+
+Commands:
+ login EMAIL PASSWORD
+ logout
+ list [-c]
+ find [-c] SRC...
+ rename FROM TO
+ delete NAME
+ upload   [-v] [-P PARALLEL] SRC...
+ download [-v] [-P PARALLEL] [-C CHANGE_DIRECTORY] [NAME...]
+
+Options:
+ -h show this help
+ -c format columns
+ -v verbose
+ -P parallel
+ -C change directory
+
+Examples:
+  Upload all missing videos from Downloads directory. Four at a time.
+    gpmlcli   upload -P 4    ~/Downloads
+  Upload a particular video, and show progress meter.
+    gpmlcli   upload         GH011234.MP4
+  Download all missing videos to Downloads directory. Four at a time.
+    gpmlcli download -P 4 -C ~/Downloads
+  Download a particular video to the current directory.
+    gpmlcli download         GH011234.MP4'
+
+assert -e 0 -o "${USAGE:?}" ./gpmlcli -h
+assert -e 1 -o "${USAGE:?}" ./gpmlcli
+
+assert ./gpmlcli logout
+assert ./gpmlcli login "${EMAIL:?}" "${PASSWORD:?}"
+
+TEST_FILE='Test Video.MP4'
+RENAMED_TEST_FILE="Renamed ${TEST_FILE:?}"
+
+assert ./gpmlcli delete -- "${TEST_FILE:?}"
+assert ./gpmlcli delete -- "${RENAMED_TEST_FILE:?}"
+
+assert -o "Uploading ${TEST_FILE:?}.
+Uploaded  ${TEST_FILE:?}." ./gpmlcli upload -P 2 -- "${TEST_FILE:?}"
+
+assert ./gpmlcli upload -P 2 -- "${TEST_FILE:?}"
+
+assert -o "${TEST_FILE:?} already exists." ./gpmlcli upload -v -- "${TEST_FILE:?}"
+
+assert -o "Renaming ${TEST_FILE:?} to ${RENAMED_TEST_FILE:?}.
+Renamed  ${TEST_FILE:?} to ${RENAMED_TEST_FILE:?}." ./gpmlcli rename -- "${TEST_FILE:?}" "${RENAMED_TEST_FILE:?}"
+
+assert -o "Downloading ${RENAMED_TEST_FILE:?}.
+Downloaded  ${RENAMED_TEST_FILE:?}." ./gpmlcli download -P 2 -C gpmlclitest.tmp -- "${RENAMED_TEST_FILE:?}"
+
+assert ./gpmlcli download -P 2 -C gpmlclitest.tmp "${RENAMED_TEST_FILE:?}"
+
+assert -o "${RENAMED_TEST_FILE:?} already exists." ./gpmlcli download -v -P 2 -C gpmlclitest.tmp -- "${RENAMED_TEST_FILE:?}"
+
+assert cmp -- "${TEST_FILE:?}" gpmlclitest.tmp/"${RENAMED_TEST_FILE:?}"
+
+assert -o "Deleting ${RENAMED_TEST_FILE:?}.
+Deleted  ${RENAMED_TEST_FILE:?}." ./gpmlcli delete -- "${RENAMED_TEST_FILE:?}"
+
+assert ./gpmlcli delete -- "${RENAMED_TEST_FILE:?}"
+
+rm -rf gpmlclitest.tmp
+
+echo "All tests passed." >&2
